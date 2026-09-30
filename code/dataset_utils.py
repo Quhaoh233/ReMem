@@ -1,395 +1,306 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
-import pickle
-from PIL import Image
-from io import BytesIO
-import random
-import datasets
-import requests
-import sys
+"""Adapt local datasets to the common question/content/answer sample format.
+
+Recommendation questions contain three fields separated by SECTION_SEPARATOR;
+content uses the same delimiter between history items. QA questions are plain text.
+"""
+
 import json
+import pickle
+import random
+from pathlib import Path
+
+import pandas as pd
 import prompt_utils
-import evaluation_utils
-import utils
+from torch.utils.data import Dataset
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+RECOMMENDATION_TASKS = {"searching", "judging"}
 
 
 def load_dataset(args):
+    """Load supported evaluation data relative to the project, not the shell."""
     if args.dataset == "webwalkerqa_main":
-        return WebWalkerDataset(file_path="../data/webwalkerqa_main.jsonl")
-    elif args.dataset == "movietv":
-        return InstructRecDataset(file_path="../data/", domain="movietv", task=args.task)
-    elif args.dataset == "books":
-        return InstructRecDataset(file_path="../data/", domain="books", task=args.task)
-    elif args.dataset == "games":
-        return VideoGamesDataset(file_path="../data/games/", task=args.task)
-    elif args.dataset == "mind2web":
-        return datasets.load_dataset("osunlp/Mind2Web", split="test")  # first item: train_dataset[0]
-    elif args.dataset == "hotpotqa":
-        return HotPotQADataset(file_path="../data/hotpotqa/eval_400.json")
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}")
+        return WebWalkerDataset()
+    if args.dataset in {"movietv", "books"}:
+        return InstructRecDataset(domain=args.dataset, task=args.task)
+    if args.dataset == "games":
+        return VideoGamesDataset(task=args.task)
+    if args.dataset == "hotpotqa":
+        return HotPotQADataset()
+    # Raw Mind2Web rows do not implement this project's sample contract.
+    raise ValueError(f"Unsupported dataset: {args.dataset}")
 
 
-# web agent dataset
+def _question(candidates, task, instruction=""):
+    """Join candidate information, memory instructions, and the final question."""
+    memory_question = "Based on the user's interaction history, summarize preferences that can help the recommendation."
+    if instruction:
+        memory_question += f" Recommendation instruction: [{instruction}]"
+    final_question = (
+        prompt_utils.SEARCHING_QUESTION
+        if task == "searching"
+        else prompt_utils.JUDGING_QUESTION
+    )
+    # split_question() depends on this order: candidates, memory task, final task.
+    return prompt_utils.SECTION_SEPARATOR.join(
+        (candidates, memory_question, final_question)
+    )
+
+
+def _as_text(value):
+    """Metadata descriptions may be lists, strings, or missing values."""
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(part) for part in value)
+    return "unknown" if value is None or pd.isna(value) else str(value)
+
+
 class WebWalkerDataset(Dataset):
-    def __init__(self, file_path=f"../data/webwalkerqa_main.jsonl"):
-        self.data = pd.read_json(file_path, lines=True)
+    """Read cached OCR text for web questions; screenshots are not model inputs."""
+
+    def __init__(self, file_path=None):
+        self.file_path = (
+            Path(file_path)
+            if file_path is not None
+            else DATA_DIR / "webwalkerqa_main.jsonl"
+        )
+        self.data = pd.read_json(self.file_path, lines=True)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        question = self.data.iloc[idx].get("question", "")
-        golden_answer = self.data.iloc[idx].get("answer", "")
-        root_url = self.data.iloc[idx].get("root_url", "")
-        info = self.data.iloc[idx].get("info", {})
-        domain = info.get("domain", "")
-        difficulty = info.get("difficulty_level", "")
-        lang = info.get("lang", "en")
-        question_type = info.get("type", "")
-        source_websites = info.get("source_website", [])
-        golden_path = info.get("golden_path", [])
-
+        row = self.data.iloc[idx]
+        info = row.get("info", {})
+        if not isinstance(info, dict):
+            info = {}
+        ocr_path = (
+            self.file_path.parent
+            / "webwalkerqa"
+            / "ocr_results"
+            / f"website_{idx}"
+            / "result.mmd"
+        )
         try:
-            with open(f"../data/webwalkerqa/content_{idx}.txt", "r", encoding="utf-8") as file:
-                html_content = file.read()
-        except Exception as e:
-            html_content = "No content available."
-
-        try:
-            with open(f"../data/webwalkerqa/ocr_results/website_{idx}/result.mmd", "r", encoding="utf-8") as file:
-                ocr_content = file.read()
-        except Exception as e:
+            ocr_content = ocr_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             ocr_content = "No content available."
-
-        try:
-            image = Image.open(f"../data/webwalkerqa/website_{idx}.png").convert("RGB")
-        except Exception as e:
-            image = None
-
-        # The mainbody HTML content of the website is as follows: {html_content}
-        content = f"""
-The parsing of the website screenshot is as follows:
-        {ocr_content}
-        """    
-            
-        return {"idx": idx,
-                "question": question,
-                "answer": golden_answer,
-                "content": content,
-                "root_url": root_url,
-                "domain": domain,
-                "difficulty": difficulty,
-                "lang": lang,
-                "question_type": question_type,
-                "image": None,
-                }
+        return {
+            "idx": idx,
+            "question": row.get("question", ""),
+            "answer": row.get("answer", ""),
+            "content": f"The parsing of the website screenshot is as follows:\n{ocr_content}",
+            "root_url": row.get("root_url", ""),
+            "domain": info.get("domain", ""),
+            "difficulty": info.get("difficulty_level", ""),
+            "lang": info.get("lang", "en"),
+            "question_type": info.get("type", ""),
+            "candidates": "",
+            "image": None,
+            "seq_l": 1,
+        }
 
 
 class InstructRecDataset(Dataset):
-    def __init__(self, file_path="../data/", domain="movietv", task="searching"):
-        if domain not in ["movietv", "books"]:
-            raise ValueError(f"Unsupported domain: {domain}")
+    """Build recommendation examples from trusted local InstructRec pickle files."""
 
-        self.data = pickle.load(open(file_path + f"{domain}All_recagent.pkl", "rb"))
-        self.ads = pickle.load(open(file_path + f"{domain}All_recagent_1ads.pkl", "rb"))
-        self.asin_mapping = pd.read_csv(file_path + f"combined_{domain}_asin_mapping.csv")
+    def __init__(self, file_path=None, domain="movietv", task="searching"):
+        if domain not in {"movietv", "books"}:
+            raise ValueError(f"Unsupported domain: {domain}")
+        if task not in RECOMMENDATION_TASKS:
+            raise ValueError(f"Unsupported task: {task}")
+        directory = Path(file_path) if file_path is not None else DATA_DIR / domain
+        with (directory / f"{domain}All_recagent.pkl").open("rb") as file:
+            self.data = pickle.load(file)
+        self.asin_mapping = pd.read_csv(
+            directory / f"combined_{domain}_asin_mapping.csv"
+        )
         self.domain = domain
-        if domain == "movietv":
-            self.meta_data = pd.read_json(file_path + "meta_Movies_and_TV.json.gz", lines=True)
-        elif domain == "books":
-            self.meta_data = pd.read_json(file_path + "meta_Books.json.gz", lines=True)  # .reset_index(drop=True)
-        
         self.task = task
 
     def __len__(self):
         return len(self.data)
 
+    def _candidate(self, item_id):
+        rows = self.asin_mapping[self.asin_mapping["index"] == item_id]
+        if rows.empty:
+            raise ValueError(f"Missing candidate metadata for item {item_id!r}")
+        # Mapping files can repeat IDs; preserve the original first-match policy.
+        return rows.iloc[0]
+
     def __getitem__(self, idx):
-        """ 
-Each example corresponding to a recommendation instance for a user, containing the following fields:
-1. 'reviewText': the review text of the interacted item, LIST -> str
-2. 'title': the title of interacted items, e.g., ['Divergent (Divergent, #1)', 'Shadow Kiss (Vampire Academy, #3)', 'Steel Lily (Periodic, #1)', 'Nameless  (Broken City, #1)'], LIST
-3. 'description': the description of interacted items, LIST
-4. 'asin': the ASIN of interacted items, e.g., [21358, 71318, 1549, 60527], LIST
-5. 'instruction': a recommendation instruction generated by prompting a LLM with the user's historical behaviors and the candidate items' information (e.g., title, description, etc.)
-6. 'persona': a persona for the user, which is generated by prompting a LLM with the user's historical behaviors (e.g., reviews, clicks, etc.)
-7. 'ranked_lists': a list of 10 candidate lists, each containing 10 items, where the first item is the golden item and the rest are negative samples.
-        """
-        title = self.data["title"].iloc[idx]
-        asin = self.data["asin"].iloc[idx]
-        description = self.data["description"].iloc[idx]
-        reviewText = self.data["reviewText"].iloc[idx]
-        instruction = self.data["instruction"].iloc[idx]
-        persona = self.data["persona"].iloc[idx]
-        ranked_lists = self.data["ranked_lists"].iloc[idx]
-
-        # # image retrieval # TODO
-        # images = []
-        # # for t in title:
-        # #     try:
-        # #         result = evaluation_utils.sentence_similarity_judge(t, self.meta_data["title"].tolist())
-        # #     except Exception as e:
-        # #         print(f"Error fetching image for title [{t}]: {str(e)}")
-        # #         images.append(None)
-        # print(len(self.asin_mapping["asin"]))
-        # print("asin_mapping:", self.asin_mapping["asin"].tolist()[:10])
-        # print("data:", self.data["asin"].tolist()[:10])
-        # print("ads:", self.ads["asin"].tolist()[:10])
-        # print("meta_data:", self.meta_data["asin"].tolist()[:10])
-        # print(images)
-        # sys.exit()
-
-        # construct the content by concatenating the persona and the user's historical interacted items (including title, description, and review text)
-        n_items = len(title)  # number of interacted items
-        content = f"""
-You have some information about this user: {persona}.
-You are given the user's historical interacted items in chronological order, including their titles, ASINs, descriptions, and reviews. The user's historical interacted items are as follows:
-         """
-        for n in range(n_items):
-            user_history = f"""
----<split>---
-The {n+1}-th interacted item:
-Title: {title[n]}
-Description: {description[n]}
-Review Text: {reviewText[n]}
-            """
-            content += user_history
-        
-        # --------------------- Searching Task Prompt Construction ---------------------
+        row = self.data.iloc[idx]
+        titles = row["title"]
+        content = (
+            f"You have some information about this user: {row['persona']}.\n"
+            "The user's historical interacted items are in chronological order:\n"
+        )
+        # Keep one delimiter per interaction so memory reasoning can group items.
+        for number, title in enumerate(titles):
+            content += (
+                f"{prompt_utils.SECTION_SEPARATOR}\nInteracted item {number + 1}:\n"
+                f"Title: {title}\nDescription: {_as_text(row['description'][number])}\n"
+                f"Review Text: {_as_text(row['reviewText'][number])}\n"
+            )
+        ranked_items = list(row["ranked_lists"])
+        # Some exports contain multiple candidate lists. Use the first list.
+        if ranked_items and isinstance(ranked_items[0], (list, tuple)):
+            ranked_items = list(ranked_items[0])
+        if not ranked_items:
+            raise ValueError(f"No candidates for sample {idx}")
+        # The source export puts the correct item first, before prompt shuffling.
+        target_id = ranked_items[0]
         if self.task == "searching":
-            # extract candidates
-            c = 0
-            candidates = """
-The candidate items for recommendation is as follows:
-            """
-            for candidate in ranked_lists:
-                candidate = self.asin_mapping[self.asin_mapping["index"] == candidate].iloc[0]  # There are some repetitions, so we use the first one we find
-                candidate_title = candidate["title"]
-                candidate_description = candidate["description"]
-                if c == 0:
-                    golden_answer = candidate_title  # the golden answer is the last item in the ranked list
-                c += 1
-
-                candidates += f"""
-Candidate {c}:
-Title: {candidate_title}
-Description: {candidate_description}
-    """
-            
-            memory_question = f"""
----<split>---
-Based on the user's historical interacted items and the recommendation instruction: [{instruction}], please provide a concise memory of preferences for the user that can help the recommendation.
-            """
-
-            final_question = f"""
----<split>---
-{prompt_utils.SEARCHING_QUESTION}
-            """
-
-        # --------------------- Judging Task Prompt Construction ---------------------
-        elif self.task == "judging":
-            # candidate
-            options = ["target", "negative"]
-            result = random.choice(options)
-            if result == "target":
-                target = ranked_lists[0]  # the golden answer is the first item in the first ranked list
-                target = self.asin_mapping[self.asin_mapping["index"] == target].iloc[0]
-                title = target["title"]
-                description = target["description"]
-            else:
-                negative = ranked_lists[random.randint(1,9)]  # randomly sample a negative item from the first ranked list
-                negative = self.asin_mapping[self.asin_mapping["index"] == negative].iloc[0]
-                title = negative["title"]
-                description = negative["description"]
-
-            # prompt construction
-            candidates = f"""
-Candidate Item ID: {result}
-Title: {title}
-Description: {description}
-            """
-
-            memory_question = f"""
----<split>---
-Based on the user's historical interacted items, please provide a concise memory of preferences for the user that can help the recommendation.
-            """
-
-            final_question = f"""
----<split>---
-{prompt_utils.JUDGING_QUESTION}
-            """
-
-            golden_answer = "Yes" if result == "target" else "No"
+            golden_answer = self._candidate(target_id)["title"]
+            candidate_ids = ranked_items.copy()
+            # Prevent candidate position from revealing the expected answer.
+            random.shuffle(candidate_ids)
         else:
-            raise ValueError(f"Unsupported task: {self.task}")
-
-
-        question = candidates + memory_question + final_question
-
-        return {"idx": idx,
-                "question": question,
-                "answer": golden_answer,
-                "content": content,
-                "domain": self.domain,
-                "candidates": candidates,
-                "image": None,
-                "seq_l": n_items,
-                }
+            negative_ids = [item for item in ranked_items[1:] if item != target_id]
+            if not negative_ids:
+                raise ValueError(f"No negative candidates for sample {idx}")
+            # Judging presents one item and uses its sampled class as Yes/No truth.
+            is_target = random.choice((True, False))
+            candidate_ids = [target_id if is_target else random.choice(negative_ids)]
+            golden_answer = "Yes" if is_target else "No"
+        candidates = "Candidate items:\n"
+        for number, item_id in enumerate(candidate_ids, start=1):
+            candidate = self._candidate(item_id)
+            # Neutral numbering avoids leaking target/negative labels to the model.
+            candidates += (
+                f"Candidate {number}:\nTitle: {candidate['title']}\n"
+                f"Description: {_as_text(candidate['description'])}\n"
+            )
+        return {
+            "idx": idx,
+            "question": _question(candidates, self.task, row["instruction"]),
+            "answer": golden_answer,
+            "content": content,
+            "domain": self.domain,
+            "candidates": candidates,
+            "image": None,
+            "seq_l": len(titles),
+        }
 
 
 class VideoGamesDataset(Dataset):
-    def __init__(self, file_path="../data/games/", task="judging", item_num_threshold=50):
-        self.meta_data = pd.read_json(file_path+"meta_Video_Games.jsonl.gz", lines=True)
-        self.reviews = pd.read_json(file_path+"Video_Games.jsonl.gz", lines=True)
-        self.train = pd.read_csv(file_path+"train.txt")
-        self.valid = pd.read_csv(file_path+"valid.txt")
-        self.train_valid = pd.read_csv(file_path+"train_valid.txt")
-        self.test = pd.read_csv(file_path+"test.txt")
-        self.item_list = pd.read_csv(file_path+"item_list.txt", header=None)[0].tolist()
-        self.user_list = pd.read_csv(file_path+"user_list.txt", header=None)[0].tolist()
+    """Build examples from headerless user/item interaction files and metadata."""
+
+    def __init__(self, file_path=None, task="judging", item_num_threshold=50):
+        if task not in RECOMMENDATION_TASKS:
+            raise ValueError(f"Unsupported task: {task}")
+        if item_num_threshold <= 0:
+            raise ValueError("item_num_threshold must be positive.")
+        directory = Path(file_path) if file_path is not None else DATA_DIR / "games"
+        self.meta_data = pd.read_json(
+            directory / "meta_Video_Games.jsonl.gz", lines=True
+        )
+        self.reviews = pd.read_json(directory / "Video_Games.jsonl.gz", lines=True)
+        # Each line is "user_id item_id ..."; the first line is data, not a header.
+        self.train_valid = pd.read_csv(
+            directory / "train_valid.txt", header=None, dtype=str
+        )
+        self.test = pd.read_csv(directory / "test.txt", header=None, dtype=str)
+        self.item_list = pd.read_csv(
+            directory / "item_list.txt", header=None, dtype=str
+        )[0].tolist()
         self.task = task
         self.item_num_threshold = item_num_threshold
+        self._metadata = self.meta_data.drop_duplicates("parent_asin").set_index(
+            "parent_asin"
+        )
+        # Join by user ID because train and test rows may have different orders.
+        self._targets = {}
+        for line in self.test[0]:
+            user, *items = line.split()
+            if not items:
+                raise ValueError(f"Missing test item for user {user}")
+            self._targets[user] = items[0]
+        # Preserve source order while removing duplicates and missing metadata.
+        self._candidate_items = list(
+            dict.fromkeys(
+                item for item in self.item_list if item in self._metadata.index
+            )
+        )
 
     def __len__(self):
-        return len(self.data)
+        return len(self.train_valid)
+
+    def _item_text(self, item):
+        if item not in self._metadata.index:
+            return "unknown", "unknown", "unknown"
+        info = self._metadata.loc[item]
+        return tuple(
+            _as_text(info[field]) for field in ("title", "description", "features")
+        )
 
     def __getitem__(self, idx):
-        sample = self.train_valid.iloc[idx,0].split(" ")
-        user = sample[0]
-        items = sample[1:]
-        seq_l = len(items)
-        if len(items) > self.item_num_threshold:
-            items = items[-self.item_num_threshold:]  # keep the most recent items
-
-        content = f"""
-You are given the user's historical interacted items in chronological order, including their titles, ASINs, descriptions, and reviews. The user's historical interacted items are as follows:
-         """
-        n = 0
-        for item in items:
-            # load review
-            review = self.reviews.loc[(self.reviews["parent_asin"] == item) & (self.reviews["user_id"] == user), "text"]
-            if review.empty:
-                review = "No review available."
-            else:
-                review = review.values[0]
-            # load meta data
-            inf = self.meta_data.loc[self.meta_data["parent_asin"] == item]
-            if inf.empty:
-                title = "unknown"
-                description = "unknown"
-                feature = "unknown"
-            else:
-                title = inf["title"].values[0]
-                description = " ".join(inf["description"].values[0])
-                feature = " ".join(inf["features"].values[0])
-
-            content += f"""
----<split>---
-The {n+1}-th interacted item:
-Title: {title}
-Description: {description}
-Features: {feature}
-Review: {review}
-            """
-            n += 1
-
-        # ---------------------- Searching Task Prompt Construction ---------------------
+        user, *all_items = self.train_valid.iloc[idx, 0].split()
+        # Show recent history, but retain all positives for negative filtering.
+        items = all_items[-self.item_num_threshold :]
+        target = self._targets.get(user)
+        if target is None or target not in self._metadata.index:
+            raise ValueError(f"Missing test target or metadata for user {user}")
+        # Exclude all historical positives and the held-out target from negatives.
+        excluded = set(all_items) | {target}
+        negative_pool = [item for item in self._candidate_items if item not in excluded]
+        if not negative_pool:
+            raise ValueError(f"No negative candidates for user {user}")
+        content = "The user's historical interacted items are in chronological order:\n"
+        for number, item in enumerate(items, start=1):
+            reviews = self.reviews.loc[
+                (self.reviews["parent_asin"] == item)
+                & (self.reviews["user_id"] == user),
+                "text",
+            ]
+            review = reviews.iloc[0] if not reviews.empty else "No review available."
+            title, description, features = self._item_text(item)
+            content += (
+                f"{prompt_utils.SECTION_SEPARATOR}\nInteracted item {number}:\n"
+                f"Title: {title}\nDescription: {description}\n"
+                f"Features: {features}\nReview: {review}\n"
+            )
         if self.task == "searching":
-            target = self.test.iloc[idx,0].split(" ")[1]
-            inf = self.meta_data.loc[self.meta_data["parent_asin"] == target]
-            title = inf["title"].values[0]
-            description = " ".join(inf["description"].values[0])
-            feature = " ".join(inf["features"].values[0])
-
-            golden_answer = title  # the golden answer is the next interacted item
-
-            candidates = f"""
-The candidate items for recommendation is as follows:
-Candidate 0:
-Title: {title}
-Description: {description}
-Features: {feature}
-            """
-
-            for c in range(9):
-                neg = random.randint(0, len(self.item_list)-1)
-                negative = self.item_list[neg]
-                # construct candidates
-                inf = self.meta_data.loc[self.meta_data["parent_asin"] == negative]
-                title = inf["title"].values[0]
-                description = " ".join(inf["description"].values[0])
-                feature = " ".join(inf["features"].values[0])
-                candidates += f"""
-Candidate {c+1}:
-Title: {title}
-Description: {description}
-Features: {feature}
-"""
-            final_question = f"""
-    ---<split>---
-    {prompt_utils.SEARCHING_QUESTION}
-            """
-
-
-        # ---------------------- Judging Task Prompt Construction ---------------------
-        elif self.task == "judging":
-            # candidate
-            options = ["target", "negative"]
-            result = random.choice(options)
-            golden_answer = "Yes" if result == "target" else "No"
-            if result == "target":
-                target = self.test.iloc[idx,0].split(" ")[1]
-                inf = self.meta_data.loc[self.meta_data["parent_asin"] == target]
-                title = inf["title"].values[0]
-                description = " ".join(inf["description"].values[0])
-                feature = " ".join(inf["features"].values[0])
-            else:
-                neg_idx = random.randint(0, len(self.item_list)-1)
-                negative = self.item_list[neg_idx]
-                inf = self.meta_data.loc[self.meta_data["parent_asin"] == negative]
-                title = inf["title"].values[0]
-                description = " ".join(inf["description"].values[0])
-                feature = " ".join(inf["features"].values[0])
-        
-            # prompt construction
-            candidates = f"""
-    Candidate Item ID: {target if result == "target" else negative}
-    Title: {title}
-    Description: {description}
-    Features: {feature}
-            """
-
-            final_question = f"""
-    ---<split>---
-    {prompt_utils.JUDGING_QUESTION}
-            """
+            golden_answer = self._item_text(target)[0]
+            candidate_ids = [target] + random.sample(
+                negative_pool, min(9, len(negative_pool))
+            )
+            # Prevent candidate position from revealing the expected answer.
+            random.shuffle(candidate_ids)
         else:
-            raise ValueError(f"Unsupported task: {self.task}")
+            # Judging presents one item and uses its sampled class as Yes/No truth.
+            is_target = random.choice((True, False))
+            candidate_ids = [target if is_target else random.choice(negative_pool)]
+            golden_answer = "Yes" if is_target else "No"
+        candidates = "Candidate items:\n"
+        for number, item in enumerate(candidate_ids, start=1):
+            title, description, features = self._item_text(item)
+            candidates += (
+                f"Candidate {number}:\nTitle: {title}\n"
+                f"Description: {description}\nFeatures: {features}\n"
+            )
+        return {
+            "idx": idx,
+            "question": _question(candidates, self.task),
+            "answer": golden_answer,
+            "content": content,
+            "domain": "videogames",
+            "candidates": candidates,
+            "image": None,
+            # Report the original history length, before the display threshold.
+            "seq_l": len(all_items),
+        }
 
-        memory_question = f"""
----<split>---
-Based on the user's historical interacted items, please provide a concise memory of preferences for the user that can help the recommendation.
-        """
 
-        question = candidates + memory_question + final_question
-
-        return {"idx": idx,
-                "question": question,
-                "answer": golden_answer,
-                "content": content,
-                "domain": "videogames",
-                "candidates": candidates,
-                "image": None,
-                "seq_l": seq_l,
-                }
-
-
-# long-context reasoning dataset
 class HotPotQADataset(Dataset):
-    def __init__(self, file_path="../data/hotpotqa/eval_200.json"):
-        with open(file_path, "r", encoding="utf-8") as file:
+    """Read long-context QA examples using the same fields as recommendation data."""
+
+    def __init__(self, file_path=None):
+        path = (
+            Path(file_path)
+            if file_path is not None
+            else DATA_DIR / "hotpotqa" / "eval_400.json"
+        )
+        with path.open("r", encoding="utf-8") as file:
             self.data = json.load(file)
 
     def __len__(self):
@@ -397,17 +308,13 @@ class HotPotQADataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.data[idx]
-        question = sample["input"]
-        golden_answer = sample["answers"]
-        context = sample["context"]
-        ori_idx = sample["index"]
-        num_docs = sample["num_docs"]
-
-        return {"idx": ori_idx,
-                "question": question,
-                "answer": golden_answer,
-                "content": context,
-                "domain": "hotpotqa",
-                "candidates": None,
-                "image": None,
-                }
+        return {
+            "idx": sample["index"],
+            "question": sample["input"],
+            "answer": sample["answers"],
+            "content": sample["context"],
+            "domain": "hotpotqa",
+            "candidates": "",
+            "image": None,
+            "seq_l": sample.get("num_docs", 0),
+        }

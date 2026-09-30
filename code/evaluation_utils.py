@@ -1,39 +1,37 @@
-import os
+"""Evaluate model answers while keeping judge failures distinct from wrong answers."""
+
 import json
 import logging
-from openai import OpenAI
+import os
+from functools import lru_cache
+from pathlib import Path
+
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer, util
+from openai import OpenAI
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
-# reads the .env file in the current directory and loads the environment variables into the process's environment. This allows you to access the variables using os.getenv() or directly from the environment.
-load_dotenv()
+# Locate configuration even when launched from the project root.
+load_dotenv(Path(__file__).with_name(".env"))
 
-def llm_as_judge(question, golden_answer, pred_answer, model="gpt-5-mini"):  # gpt-4.1-nano-2025-04-14, gpt-5-mini
-    
-    try:
-        if isinstance(pred_answer, dict):
-            pred_answer = pred_answer.get("answer", pred_answer)
-    except Exception:
-        pass
-    
-    if not pred_answer or (isinstance(pred_answer, str) and pred_answer.strip() == ''):
+
+# LLM as judge metric: https://github.com/bingreeky/MemEvolve
+def llm_as_judge(
+    question, golden_answer, pred_answer, model="gpt-5-mini"
+):  # gpt-4.1-nano-2025-04-14, gpt-5-mini
+    """Return correct, incorrect, or error; malformed judge output is an error."""
+    if isinstance(pred_answer, dict):
+        pred_answer = pred_answer.get("answer", pred_answer)
+
+    # An empty model response can be marked wrong without calling the judge API.
+    if not pred_answer or (isinstance(pred_answer, str) and pred_answer.strip() == ""):
         return {
             "question": question,
             "judgement": "incorrect",
             "golden_answer": golden_answer,
             "pred_answer": pred_answer,
         }
-    
+
     prompt = f"""You are a general AI assistant. Based on the [Correct Answer] provided below, determine whether the [Response] to the [Original Question] is correct.
 
 [Original Question]: {question}
@@ -57,49 +55,49 @@ Output JSON format:
 
     try:
         client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_API_BASE")
+            api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE")
         )
-        # openai_client.chat.completions.create
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {
-                    "role": "system", 
-                    "content": "You are a fair judge for web navigation tasks. Focus on core answer correctness, not formatting."
+                    "role": "system",
+                    "content": "You are a fair judge for web navigation tasks. Focus on core answer correctness, not formatting.",
                 },
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
         )
-        
-        result_text = response.choices[0].message.content.strip()
-        
+
+        result_text = (response.choices[0].message.content or "").strip()
+
         try:
             result = json.loads(result_text)
         except json.JSONDecodeError:
             # Fallback: try to extract judgement from text
             import json_repair
+
             try:
                 result = json_repair.loads(result_text)
             except Exception:
                 result = {"judgement": "error"}
-        
-        judgement = result.get('judgement', '').strip().lower()
-        if judgement not in ['correct', 'incorrect']:
-            logger.warning(f"Invalid judgement value: {judgement}, marking as 'incorrect'")
-            judgement = 'incorrect'
-        
+
+        # Parsing valid JSON is not enough: require a recognized verdict as well.
+        judgement = result.get("judgement") if isinstance(result, dict) else None
+        if isinstance(judgement, str):
+            judgement = judgement.strip().lower()
+        if judgement not in {"correct", "incorrect"}:
+            logger.warning("Invalid judge response: %r", result)
+            judgement = "error"
+
         return {
             "question": question,
             "judgement": judgement,
             "golden_answer": golden_answer,
             "pred_answer": pred_answer,
         }
-        
-    except Exception as e:
-        logger.error(f"Error judging answer: {str(e)}")
-        import traceback
-        traceback.print_exc()
+
+    except Exception:
+        logger.exception("Error judging answer")
         return {
             "question": question,
             "judgement": "error",
@@ -108,28 +106,40 @@ Output JSON format:
         }
 
 
-def sentence_similarity_judge(text1, text2, model_name="all-MiniLM-L6-v2", threshold=0.8):
+@lru_cache(maxsize=2)
+def _similarity_model(model_name):
+    """Avoid loading sentence-transformer weights for every comparison."""
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
+
+
+def sentence_similarity_judge(
+    text1, text2, model_name="all-MiniLM-L6-v2", threshold=0.8
+):
+    """Compare two strings using cosine similarity of sentence embeddings."""
     try:
-        model = SentenceTransformer(model_name)
+        from sentence_transformers import util
+
+        model = _similarity_model(model_name)
         golden_embedding = model.encode(text1, convert_to_tensor=True)
         pred_embedding = model.encode(text2, convert_to_tensor=True)
+        # Compare embedding directions, then apply the caller-selected cutoff.
         cosine_sim = util.cos_sim(golden_embedding, pred_embedding).item()
-        
+
         judgement = "correct" if cosine_sim >= threshold else "incorrect"
-        
+
         return {
             "judgement": judgement,
             "golden_answer": text1,
             "pred_answer": text2,
-            "similarity_score": cosine_sim
+            "similarity_score": cosine_sim,
         }
-    except Exception as e:
-        logger.error(f"Error in sentence similarity judge: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.exception("Error in sentence similarity judge")
         return {
             "judgement": "error",
             "golden_answer": text1,
             "pred_answer": text2,
-            "similarity_score": None
+            "similarity_score": None,
         }
