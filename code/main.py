@@ -46,7 +46,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--reasoning", choices=("vanilla", "memory", "recurrent"), default="memory"
     )
-    parser.add_argument("--task", choices=("searching", "judging"), default="judging")
+    parser.add_argument(
+        "--task", choices=("searching", "judging", "ranking"), default="judging"
+    )
     parser.add_argument(
         "--dataset",
         choices=(

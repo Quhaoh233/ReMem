@@ -48,6 +48,8 @@ SEARCHING_QUESTION = "Now, what would be the next possible item for the user fro
 
 JUDGING_QUESTION = "Now, is the user likely to interact with the given item? Please answer with a single word: 'Yes' or 'No'. No explanation is needed."
 
+RANKING_QUESTION = "Now, rank all candidate items from most likely to least likely to be the user's next interaction based on the user's interaction history and instruction. Please return only the candidate titles in ranked order, one title per line. Include every candidate exactly once; no explanation is needed."
+
 
 def split_question(question):
     """Return candidates, memory instruction, and final question.

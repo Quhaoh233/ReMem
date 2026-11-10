@@ -193,6 +193,20 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(sample["answer"], "No")
         self.assertIn("Title: negative", sample["candidates"])
 
+    def test_games_ranking_uses_a_shuffled_positive_negative_pair(self):
+        data = dataset_utils.VideoGamesDataset(self.directory, task="ranking")
+        with (
+            patch.object(random, "choice", return_value="negative"),
+            patch.object(random, "shuffle", side_effect=lambda values: values.reverse()),
+        ):
+            sample = data[0]
+        self.assertEqual(sample["answer"], "target\nnegative")
+        self.assertIn(prompt_utils.RANKING_QUESTION, sample["question"])
+        self.assertLess(
+            sample["candidates"].index("Title: negative"),
+            sample["candidates"].index("Title: target"),
+        )
+
     def test_hotpot_sample_contract(self):
         path = self.directory / "qa.json"
         path.write_text(
@@ -240,6 +254,39 @@ class DatasetTests(unittest.TestCase):
         self.assertNotIn("target", sample["question"])
         self.assertNotIn("negative", sample["question"])
 
+    def test_instructrec_ranking_preserves_gold_order_but_shuffles_prompt(self):
+        pd.DataFrame(
+            [
+                {
+                    "title": ["history"],
+                    "description": ["description"],
+                    "reviewText": ["review"],
+                    "persona": "reader",
+                    "instruction": "suggest a book",
+                    "ranked_lists": [1, 2],
+                }
+            ]
+        ).to_pickle(self.directory / "booksAll_recagent.pkl")
+        pd.DataFrame(
+            [
+                {"index": 1, "title": "book A", "description": "A"},
+                {"index": 2, "title": "book B", "description": "B"},
+            ]
+        ).to_csv(self.directory / "combined_books_asin_mapping.csv", index=False)
+        data = dataset_utils.InstructRecDataset(
+            self.directory, domain="books", task="ranking"
+        )
+        with patch.object(
+            random, "shuffle", side_effect=lambda values: values.reverse()
+        ):
+            sample = data[0]
+        self.assertEqual(sample["answer"], "book A\nbook B")
+        self.assertIn(prompt_utils.RANKING_QUESTION, sample["question"])
+        self.assertLess(
+            sample["candidates"].index("Title: book B"),
+            sample["candidates"].index("Title: book A"),
+        )
+
 
 class TrainingTests(unittest.TestCase):
     def test_train_is_called_before_save_and_grpo_receives_rewards(self):
@@ -279,6 +326,69 @@ class TrainingTests(unittest.TestCase):
                 trl.GRPOTrainer.call_args.kwargs["reward_funcs"], ["reward-model"]
             )
             self.assertNotIn("data_collator", trl.GRPOTrainer.call_args.kwargs)
+
+            sample = {
+                "question": "Which one?",
+                "content": "Useful context",
+                "answer": "Alpha",
+                "image": None,
+            }
+            example = learning.convert_to_grpo_example(sample)
+            prompt_text = str(example["prompt"])
+            self.assertIn("Useful context", prompt_text)
+            self.assertNotIn("Alpha", prompt_text)
+            self.assertEqual(example["answer"], "Alpha")
+
+            trl.GRPOTrainer.reset_mock()
+            multi_model = SimpleNamespace(save_pretrained=lambda path: None)
+            learning.multi_conversion_grpo_tuning(
+                multi_model,
+                tokenizer,
+                {
+                    "vanilla": [example],
+                    "recurrent": [dict(example, answer="Beta")],
+                },
+                reward_funcs=["reward-model"],
+            )
+            combined = trl.GRPOTrainer.call_args.kwargs["train_dataset"]
+            self.assertEqual(
+                [row["conversion"] for row in combined],
+                ["vanilla", "recurrent"],
+            )
+            self.assertEqual([row["answer"] for row in combined], ["Alpha", "Beta"])
+
+            with self.assertRaisesRegex(ValueError, "non-empty mapping"):
+                learning.multi_conversion_grpo_tuning(
+                    multi_model,
+                    tokenizer,
+                    {},
+                    reward_funcs=["reward-model"],
+                )
+
+            multiline = (
+                "<reasoning>\nfirst\nsecond\n</reasoning>\n"
+                "<answer>\nALPHA\n</answer>\n"
+            )
+            self.assertEqual(learning.strict_format_reward_func([multiline]), [0.5])
+            completions = [
+                [{"role": "assistant", "content": multiline}],
+                "<answer>beta</answer>",
+            ]
+            self.assertEqual(
+                learning.correctness_reward_func(
+                    completions=completions,
+                    answer=[["alpha", "a"], "gamma"],
+                ),
+                [1.0, 0.0],
+            )
+
+            with self.assertRaisesRegex(ValueError, "prompt"):
+                learning.grpo_tuning(
+                    model,
+                    tokenizer,
+                    [{"messages": []}],
+                    reward_funcs=["reward-model"],
+                )
 
     def test_checkpoint_path_and_modality_are_respected(self):
         unsloth = ModuleType("unsloth")
@@ -402,6 +512,9 @@ class MainTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_cli_accepts_ranking_task(self):
+        self.assertEqual(main.parse_args(["--task", "ranking"]).task, "ranking")
+
     def test_cli_rejects_invalid_chunk_size(self):
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             main.parse_args(["--chunk_size", "0"])

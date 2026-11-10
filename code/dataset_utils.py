@@ -14,7 +14,7 @@ import prompt_utils
 from torch.utils.data import Dataset
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-RECOMMENDATION_TASKS = {"searching", "judging"}
+RECOMMENDATION_TASKS = {"searching", "judging", "ranking"}
 
 
 def load_dataset(args):
@@ -36,11 +36,11 @@ def _question(candidates, task, instruction=""):
     memory_question = "Based on the user's interaction history, summarize preferences that can help the recommendation."
     if instruction:
         memory_question += f" Recommendation instruction: [{instruction}]"
-    final_question = (
-        prompt_utils.SEARCHING_QUESTION
-        if task == "searching"
-        else prompt_utils.JUDGING_QUESTION
-    )
+    final_question = {
+        "searching": prompt_utils.SEARCHING_QUESTION,
+        "judging": prompt_utils.JUDGING_QUESTION,
+        "ranking": prompt_utils.RANKING_QUESTION,
+    }[task]
     # split_question() depends on this order: candidates, memory task, final task.
     return prompt_utils.SECTION_SEPARATOR.join(
         (candidates, memory_question, final_question)
@@ -154,7 +154,7 @@ class InstructRecDataset(Dataset):
             candidate_ids = ranked_items.copy()
             # Prevent candidate position from revealing the expected answer.
             random.shuffle(candidate_ids)
-        else:
+        elif self.task == "judging":
             negative_ids = [item for item in ranked_items[1:] if item != target_id]
             if not negative_ids:
                 raise ValueError(f"No negative candidates for sample {idx}")
@@ -162,6 +162,14 @@ class InstructRecDataset(Dataset):
             is_target = random.choice((True, False))
             candidate_ids = [target_id if is_target else random.choice(negative_ids)]
             golden_answer = "Yes" if is_target else "No"
+        else:
+            # InstructRec supplies candidates in relevance order. Shuffle only
+            # their presentation while retaining that order as the target.
+            golden_answer = "\n".join(
+                str(self._candidate(item_id)["title"]) for item_id in ranked_items
+            )
+            candidate_ids = ranked_items.copy()
+            random.shuffle(candidate_ids)
         candidates = "Candidate items:\n"
         for number, item_id in enumerate(candidate_ids, start=1):
             candidate = self._candidate(item_id)
@@ -266,11 +274,21 @@ class VideoGamesDataset(Dataset):
             )
             # Prevent candidate position from revealing the expected answer.
             random.shuffle(candidate_ids)
-        else:
+        elif self.task == "judging":
             # Judging presents one item and uses its sampled class as Yes/No truth.
             is_target = random.choice((True, False))
             candidate_ids = [target if is_target else random.choice(negative_pool)]
             golden_answer = "Yes" if is_target else "No"
+        else:
+            # This split labels one held-out positive but does not order its
+            # negatives. A positive-vs-negative pair is therefore the largest
+            # ranking with a fully supported gold order.
+            negative = random.choice(negative_pool)
+            golden_answer = "\n".join(
+                (str(self._item_text(target)[0]), str(self._item_text(negative)[0]))
+            )
+            candidate_ids = [target, negative]
+            random.shuffle(candidate_ids)
         candidates = "Candidate items:\n"
         for number, item in enumerate(candidate_ids, start=1):
             title, description, features = self._item_text(item)
