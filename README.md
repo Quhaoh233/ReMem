@@ -2,11 +2,12 @@
 
 Official implementation and evaluation code for **ReMem:Rethinking Perception and Memory in Long-Context Recommendation Agents**.
 
-<img width="2544" height="1281" alt="0e1e8bfd-63ca-4999-b536-bddaf262aa39" src="https://github.com/user-attachments/assets/2e9309e6-8d63-4858-b565-b0158a88e9cc" />
+<img width="3696" height="1845" alt="5125aa6e-5d6a-4483-9614-53ebfe9d691b" src="https://github.com/user-attachments/assets/929c74cc-4d35-4c86-9eb0-5f5db67e0242" />
 
 
 *A simple method is not necessarily the best, but a strong method should remain as simple as possible.*
 ReMem follows this principle by realizing long-context preference modeling through sequential memory updates within the standard autoregressive process, without introducing external retrieval systems, specialized memory modules, or architectural modifications.
+(More updates are coming soon, including model checkpoints, training code, and more.)
 
 ## Repository Structure
 
