@@ -1,4 +1,4 @@
-# Project Name
+# ReMem
 
 Official implementation and evaluation code for **ReMem:Rethinking Perception and Memory in Long-Context Recommendation Agents**.
 
